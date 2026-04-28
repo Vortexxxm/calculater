@@ -40,7 +40,6 @@ export default function VaultAuthScreen() {
           await supabase.from('vault_users').insert({
             user_id: data.user.id,
             display_name: displayName.trim() || 'My Vault',
-            email: email.trim(),
           });
           router.replace('/vault/home');
         }
