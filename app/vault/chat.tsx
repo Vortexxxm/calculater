@@ -15,7 +15,7 @@ import {
 import { router, useLocalSearchParams, useFocusEffect } from 'expo-router';
 import { supabase } from '@/lib/supabase';
 import { encrypt, decrypt } from '@/lib/crypto';
-import { ArrowLeft, Send, Lock, ShieldCheck } from 'lucide-react-native';
+import { ArrowLeft, Send, ShieldCheck, Wifi, WifiOff } from 'lucide-react-native';
 
 type DecryptedMessage = {
   id: string;
@@ -42,9 +42,11 @@ export default function ChatScreen() {
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
+  const [realtimeConnected, setRealtimeConnected] = useState(false);
   const flatRef = useRef<FlatList>(null);
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const processedIds = useRef<Set<string>>(new Set());
+  const userIdRef = useRef<string | null>(null);
 
   useFocusEffect(
     useCallback(() => {
@@ -55,6 +57,7 @@ export default function ChatScreen() {
           supabase.removeChannel(channelRef.current);
           channelRef.current = null;
         }
+        setRealtimeConnected(false);
       };
     }, [id])
   );
@@ -63,6 +66,7 @@ export default function ChatScreen() {
     const { data } = await supabase.auth.getUser();
     if (!data.user) { router.replace('/vault/auth'); return; }
     setUserId(data.user.id);
+    userIdRef.current = data.user.id;
     await loadMessages();
     subscribeToMessages();
   };
@@ -102,7 +106,12 @@ export default function ChatScreen() {
     }
 
     const channel = supabase
-      .channel(`chat:${id}`)
+      .channel(`chat:${id}`, {
+        config: {
+          broadcast: { self: true },
+          presence: { key: userIdRef.current || '' },
+        },
+      })
       .on(
         'postgres_changes',
         {
@@ -121,7 +130,19 @@ export default function ChatScreen() {
           setTimeout(() => flatRef.current?.scrollToEnd({ animated: true }), 80);
         }
       )
-      .subscribe();
+      .on('presence', { event: 'sync' }, () => {})
+      .subscribe((status: string) => {
+        if (status === 'SUBSCRIBED') {
+          setRealtimeConnected(true);
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          setRealtimeConnected(false);
+          setTimeout(() => {
+            if (channelRef.current) {
+              channelRef.current.subscribe();
+            }
+          }, 3000);
+        }
+      });
 
     channelRef.current = channel;
   };
@@ -235,6 +256,11 @@ export default function ChatScreen() {
             <View style={styles.encryptedBadge}>
               <ShieldCheck color="#30d158" size={11} strokeWidth={2} />
               <Text style={styles.encryptedText}>AES-256 encrypted</Text>
+              {realtimeConnected ? (
+                <Wifi color="#30d158" size={10} strokeWidth={2} style={{ marginLeft: 6 }} />
+              ) : (
+                <WifiOff color="#ff9f0a" size={10} strokeWidth={2} style={{ marginLeft: 6 }} />
+              )}
             </View>
           </View>
         </View>
@@ -252,6 +278,7 @@ export default function ChatScreen() {
           renderItem={renderMessage}
           contentContainerStyle={styles.messageList}
           onContentSizeChange={() => flatRef.current?.scrollToEnd({ animated: false })}
+          onLayout={() => flatRef.current?.scrollToEnd({ animated: false })}
           ListEmptyComponent={
             <View style={styles.emptyWrap}>
               <ShieldCheck color="#3a3a3c" size={40} strokeWidth={1} />
