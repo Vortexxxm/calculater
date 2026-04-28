@@ -14,12 +14,15 @@ import {
 } from 'react-native';
 import { router, useLocalSearchParams, useFocusEffect } from 'expo-router';
 import { supabase } from '@/lib/supabase';
-import { ArrowLeft, Send, Lock } from 'lucide-react-native';
+import { encrypt, decrypt } from '@/lib/crypto';
+import { ArrowLeft, Send, Lock, ShieldCheck } from 'lucide-react-native';
 
-type Message = {
+type DecryptedMessage = {
   id: string;
   conversation_id: string;
   sender_id: string;
+  encrypted_content: string;
+  iv: string;
   content: string;
   created_at: string;
 };
@@ -34,16 +37,18 @@ function avatarColor(uid: string): string {
 
 export default function ChatScreen() {
   const { id, name, otherId } = useLocalSearchParams<{ id: string; name: string; otherId: string }>();
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<DecryptedMessage[]>([]);
   const [text, setText] = useState('');
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
   const flatRef = useRef<FlatList>(null);
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const processedIds = useRef<Set<string>>(new Set());
 
   useFocusEffect(
     useCallback(() => {
+      processedIds.current = new Set();
       init();
       return () => {
         if (channelRef.current) {
@@ -62,6 +67,17 @@ export default function ChatScreen() {
     subscribeToMessages();
   };
 
+  const decryptMessage = async (raw: any): Promise<DecryptedMessage> => {
+    let plainText = '';
+    if (raw.encrypted_content && raw.iv) {
+      plainText = await decrypt(raw.encrypted_content, raw.iv);
+    }
+    if (!plainText && raw.content) {
+      plainText = raw.content;
+    }
+    return { ...raw, content: plainText };
+  };
+
   const loadMessages = async () => {
     setLoading(true);
     const { data } = await supabase
@@ -69,7 +85,12 @@ export default function ChatScreen() {
       .select('*')
       .eq('conversation_id', id)
       .order('created_at', { ascending: true });
-    setMessages(data || []);
+
+    if (data) {
+      const decrypted = await Promise.all(data.map(decryptMessage));
+      decrypted.forEach((m) => processedIds.current.add(m.id));
+      setMessages(decrypted);
+    }
     setLoading(false);
     setTimeout(() => flatRef.current?.scrollToEnd({ animated: false }), 100);
   };
@@ -90,12 +111,13 @@ export default function ChatScreen() {
           table: 'shared_messages',
           filter: `conversation_id=eq.${id}`,
         },
-        (payload) => {
-          const newMsg = payload.new as Message;
-          setMessages((prev) => {
-            if (prev.some((m) => m.id === newMsg.id)) return prev;
-            return [...prev, newMsg];
-          });
+        async (payload) => {
+          const raw = payload.new as any;
+          if (processedIds.current.has(raw.id)) return;
+          processedIds.current.add(raw.id);
+
+          const decrypted = await decryptMessage(raw);
+          setMessages((prev) => [...prev, decrypted]);
           setTimeout(() => flatRef.current?.scrollToEnd({ animated: true }), 80);
         }
       )
@@ -110,26 +132,35 @@ export default function ChatScreen() {
     setText('');
     setSending(true);
 
-    const { data: msg } = await supabase
-      .from('shared_messages')
-      .insert({
-        conversation_id: id,
-        sender_id: userId,
-        content: plainText,
-      })
-      .select()
-      .single();
+    try {
+      const { ciphertext, iv } = await encrypt(plainText);
 
-    if (msg) {
-      setMessages((prev) => {
-        if (prev.some((m) => m.id === msg.id)) return prev;
-        return [...prev, msg];
-      });
+      const { data: msg } = await supabase
+        .from('shared_messages')
+        .insert({
+          conversation_id: id,
+          sender_id: userId,
+          encrypted_content: ciphertext,
+          iv,
+          content: '',
+        })
+        .select()
+        .single();
+
+      if (msg && !processedIds.current.has(msg.id)) {
+        processedIds.current.add(msg.id);
+        const decrypted = await decryptMessage(msg);
+        setMessages((prev) => [...prev, decrypted]);
+      }
+
       await supabase
         .from('shared_conversations')
         .update({ last_message_at: new Date().toISOString() })
         .eq('id', id);
+
       setTimeout(() => flatRef.current?.scrollToEnd({ animated: true }), 80);
+    } catch (e) {
+      setText(plainText);
     }
     setSending(false);
   };
@@ -140,7 +171,7 @@ export default function ChatScreen() {
 
   const otherColor = otherId ? avatarColor(otherId) : '#0a84ff';
 
-  const renderMessage = ({ item, index }: { item: Message; index: number }) => {
+  const renderMessage = ({ item, index }: { item: DecryptedMessage; index: number }) => {
     const isMine = item.sender_id === userId;
     const showTime =
       index === messages.length - 1 ||
@@ -202,8 +233,8 @@ export default function ChatScreen() {
           <View>
             <Text style={styles.headerName}>{name}</Text>
             <View style={styles.encryptedBadge}>
-              <Lock color="#30d158" size={10} strokeWidth={2} />
-              <Text style={styles.encryptedText}>Real-time secure chat</Text>
+              <ShieldCheck color="#30d158" size={11} strokeWidth={2} />
+              <Text style={styles.encryptedText}>AES-256 encrypted</Text>
             </View>
           </View>
         </View>
@@ -220,9 +251,10 @@ export default function ChatScreen() {
           keyExtractor={(item) => item.id}
           renderItem={renderMessage}
           contentContainerStyle={styles.messageList}
+          onContentSizeChange={() => flatRef.current?.scrollToEnd({ animated: false })}
           ListEmptyComponent={
             <View style={styles.emptyWrap}>
-              <Lock color="#3a3a3c" size={40} strokeWidth={1} />
+              <ShieldCheck color="#3a3a3c" size={40} strokeWidth={1} />
               <Text style={styles.emptyText}>No messages yet</Text>
               <Text style={styles.emptySubText}>Say hello to {name}</Text>
             </View>
@@ -240,6 +272,17 @@ export default function ChatScreen() {
           multiline
           maxLength={2000}
           onSubmitEditing={sendMessage}
+          autoCorrect={false}
+          autoCapitalize="sentences"
+          spellCheck={false}
+          importantForAutofill="no"
+          autoComplete="off"
+          textContentType="none"
+          returnKeyType="send"
+          enablesReturnKeyAutomatically
+          keyboardAppearance="dark"
+          selectionColor="#0a84ff66"
+          contextMenuHidden
         />
         <TouchableOpacity
           style={[styles.sendBtn, !text.trim() && styles.sendBtnDisabled]}
